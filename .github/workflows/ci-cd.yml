@@ -1,0 +1,435 @@
+# =============================================================================
+# EDC Ingestion Platform — GitHub Actions CI/CD
+# =============================================================================
+# Mirrors the former GitLab pipeline: lint → test → security → docker + trivy,
+# Terraform fmt/validate, IaC scans.
+# CD: docker-and-trivy now pushes to Amazon ECR (replaced GHCR).
+#     New jobs added: deploy-ecs, health-check, rollback.
+# AUTHENTICATION: Now uses AWS OIDC for secure, keyless authentication
+# ===============================================================================
+name: CI/CD
+
+on:
+  push:
+    branches: [feature-branch-harish, main, develop]
+  pull_request:
+    branches: [feature-branch-harish, main, develop]
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  id-token: write  # ← Required for OIDC token generation
+
+env:
+  PYTHON_VERSION: "3.13"
+  PYTHONNOUSERSITE: "1"
+  POETRY_VERSION: "2.3.2"
+  POETRY_VIRTUALENVS_CREATE: "true"
+  POETRY_VIRTUALENVS_IN_PROJECT: "true"
+  TF_ROOT: terraform
+  MODIN_CPUS: "1"
+  # AWS / ECR 
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "130695430172"
+  ECR_REPOSITORY: vdev/ingestion_platform
+  ECS_CLUSTER: edc-cluster
+  ECS_SERVICE: edc-service
+
+jobs:
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - run: python -m pip install pipx
+      - run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - run: poetry config virtualenvs.in-project true
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - run: poetry install --no-interaction --with dev
+      - run: poetry run ruff check src/
+      - run: poetry run ruff format --check src/
+      - run: poetry run mypy src/
+
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: edc_user
+          POSTGRES_PASSWORD: edc_pass
+          POSTGRES_DB: edc_platform_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://edc_user:edc_pass@localhost:5432/edc_platform_test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - run: python -m pip install pipx
+      - run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - run: poetry config virtualenvs.in-project true
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - run: poetry install --no-interaction --with dev
+
+      - run: |
+          poetry run pytest \
+          --cov=src/edc_ingestion \
+          --cov-report=xml:coverage.xml \
+          --cov-report=term \
+          --junitxml=junit.xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit
+          path: junit.xml
+
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks (free)
+        run: |
+          docker run --rm -v $(pwd):/repo zricethezav/gitleaks:latest detect --source=/repo
+
+
+  bandit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - run: python -m pip install pipx
+      - run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - run: poetry install --no-interaction --with dev
+      - run: pip install bandit
+      - run: bandit -r src/ --severity-level medium
+
+
+  safety:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - run: python -m pip install pipx
+      - run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - run: poetry install --no-interaction
+      - run: poetry self add poetry-plugin-export
+      - run: poetry export -f requirements.txt --output requirements.txt --without-hashes
+
+      - run: pip install safety
+      - run: safety check --file=requirements.txt
+
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install pipx
+      - run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - run: poetry install --no-interaction
+      - run: poetry self add poetry-plugin-export
+      - run: poetry export -f requirements.txt --output requirements.txt --without-hashes
+
+      - run: pipx install pip-audit
+      - run: pip-audit -r requirements.txt
+
+
+  checkov:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx install checkov
+      - run: checkov -d "${{ env.TF_ROOT }}" --framework terraform --soft-fail
+
+
+  tflint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: terraform-linters/setup-tflint@v4
+      - run: |
+          cd ${{ env.TF_ROOT }}
+          tflint --init
+          tflint
+
+
+  terraform-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: |
+          cd ${{ env.TF_ROOT }}
+          terraform init -backend=false
+          terraform fmt -check -recursive
+          terraform validate
+
+
+  #  DOCKER + TRIVY 
+  # Changed: GHCR → Amazon ECR. All original build/scan logic preserved.
+  # Image is now tagged with git SHA (not "latest") for traceability.
+  # Authentication: AWS OIDC (keyless) instead of short-lived credentials
+  
+  docker-and-trivy:
+    runs-on: ubuntu-latest
+    needs: [lint, test, bandit, gitleaks, pip-audit]
+    outputs:
+      image: ${{ steps.set-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      #  AWS OIDC auth 
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "arn:aws:iam::130695430172:role/github-actions-vdev-ingestion_platform"
+          aws-region: ${{ env.AWS_REGION }}
+
+      #  ECR login 
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      #  Set image name 
+      # main branch → plain SHA tag (production)
+      # feature-branch-harish → "feature-<SHA>" tag (test, never used by ECS prod)
+      - name: Set image name
+        id: set-image
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAG="${{ github.sha }}"
+          else
+            TAG="feature-${{ github.sha }}"
+          fi
+          IMAGE=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:$TAG
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+      #  Build 
+      - name: Build local image
+        run: docker build -t ${{ steps.set-image.outputs.image }} .
+
+      #  Push to ECR (main + feature-branch-harish) 
+      # main      → SHA tag       (production image)
+      # feature-* → feature-<SHA> (test image, isolated from prod)
+      - name: Push image to ECR
+        if: |
+          github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/feature-branch-harish'
+        run: docker push ${{ steps.set-image.outputs.image }}
+
+      #  Trivy scan (after push, all pushed branches) 
+      - name: Trivy scan (remote)
+        if: |
+          github.ref == 'refs/heads/main' ||
+          github.ref == 'refs/heads/feature-branch-harish'
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ steps.set-image.outputs.image }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+
+      #  Trivy scan local only (develop + other branches, no push) 
+      - name: Trivy scan (local — other branches)
+        if: |
+          github.ref != 'refs/heads/main' &&
+          github.ref != 'refs/heads/feature-branch-harish'
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ steps.set-image.outputs.image }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+
+  # NEW: ECS DEPLOY (main only, after successful CI) 
+  deploy-ecs:
+    runs-on: ubuntu-latest
+    needs: docker-and-trivy
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "arn:aws:iam::130695430172:role/github-actions-vdev-ingestion_platform"
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Store current task definition ARN in SSM before deploying (enables cross-job rollback)
+      - name: Save current task definition ARN to SSM
+        id: current-task
+        run: |
+          TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query "services[0].taskDefinition" \
+            --output text)
+          echo "Saving previous task def: $TASK_DEF"
+          aws ssm put-parameter \
+            --name "/edc/previous-task-def" \
+            --value "$TASK_DEF" \
+            --type String \
+            --overwrite
+          echo "previous_task_def=$TASK_DEF" >> $GITHUB_OUTPUT
+
+      # Register a new task definition revision with the new ECR image SHA
+      - name: Register new ECS task definition
+        id: register-task
+        run: |
+          IMAGE="${{ needs.docker-and-trivy.outputs.image }}"
+
+          # Fetch current task def JSON (strip non-mutable fields)
+          TASK_DEF_JSON=$(aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_SERVICE }} \
+            --query "taskDefinition" \
+            --output json | jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          # Replace the image in the first container definition
+          NEW_TASK_DEF=$(echo "$TASK_DEF_JSON" | jq --arg IMAGE "$IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE')
+
+          # Register the new revision
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "Registered new task def: $NEW_TASK_DEF_ARN"
+          echo "new_task_def=$NEW_TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS with new task definition
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.register-task.outputs.new_task_def }}
+
+      # Wait for service to stabilise (up to 10 min)
+      - name: Wait for ECS service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+
+  # NEW: HEALTH CHECK 
+  health-check:
+    runs-on: ubuntu-latest
+    needs: deploy-ecs
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "arn:aws:iam::130695430172:role/github-actions-vdev-ingestion_platform"
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check ECS service health
+        run: |
+          STATUS=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query "services[0].deployments[0].rolloutState" \
+            --output text)
+          echo "Deployment rollout state: $STATUS"
+          if [ "$STATUS" != "COMPLETED" ]; then
+            echo "Deployment did not complete successfully."
+            exit 1
+          fi
+
+  # NEW: ROLLBACK (triggers if health-check fails)
+  rollback:
+    runs-on: ubuntu-latest
+    needs: health-check
+    if: failure() && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "arn:aws:iam::130695430172:role/github-actions-vdev-ingestion_platform"
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Rolls ECS back to the previous task definition saved before deploy
+      - name: Rollback ECS to previous task definition
+        run: |
+          echo "Health check failed — rolling back ECS service."
+          PREVIOUS_TASK_DEF=$(aws ssm get-parameter \
+            --name "/edc/previous-task-def" \
+            --query "Parameter.Value" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$PREVIOUS_TASK_DEF" ]; then
+            echo "No previous task definition found in SSM. Manual rollback required."
+            exit 1
+          fi
+
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition "$PREVIOUS_TASK_DEF"
+
+          echo "Rollback triggered to: $PREVIOUS_TASK_DEF"
+
+# so ci can touch terraform deploy YAML.
+# removed terraform deploy job — will add in later sprints
+#    terraform-deploy:
+#      - name: Terraform Deploy
+#        needs: [test, lint, terraform-validate]
+#        if: github.ref == 'refs/heads/main'
+#        uses: ../infrastructure-vendor_main/.github/workflows/terraform-deploy-dev.yml
